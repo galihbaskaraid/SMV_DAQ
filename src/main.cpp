@@ -1,0 +1,363 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_log.h>
+
+// Include all managers
+#include "constants.h"
+#include "data_sensor.h"
+#include "sensor_manager.h"
+#include "gps_manager.h"
+#include "can_manager.h"
+#include "wifi_manager.h"
+
+//BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-1234567890ab"
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+
+// Global data sensor structure (shared across all tasks)
+DataSensor_t g_data_sensor = {};
+
+// Mutex for thread-safe access to global data
+SemaphoreHandle_t g_data_sensor_mutex = nullptr;
+
+// Task handles
+TaskHandle_t g_sensor_task_handle = nullptr;
+TaskHandle_t g_gps_task_handle = nullptr;
+TaskHandle_t g_can_rx_task_handle = nullptr;
+TaskHandle_t g_can_tx_task_handle = nullptr;
+TaskHandle_t g_wifi_task_handle = nullptr;
+
+// ============================================================================
+// SENSOR READ TASK (High frequency sensor reading)
+// ============================================================================
+
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        
+        ESP_LOGI(TAG_SYSTEM, "BLE Client connected");
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        ESP_LOGI(TAG_SYSTEM, "BLE Client disconnected");
+        pServer->startAdvertising();
+    }
+};
+
+void initBLE()
+{
+    ESP_LOGI(TAG_SYSTEM, "Initializing BLE...");
+    
+    BLEDevice::init("DAQ_SYSTEM");
+    BLEDevice::setMTU(247);
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    BLEService* pService = pServer->createService(SERVICE_UUID);
+
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+    pCharacteristic->addDescriptor(new BLE2902());
+
+    pService->start();
+
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(false);
+    pAdvertising->start();
+    ESP_LOGI(TAG_SYSTEM, "BLE initialized and advertising started");
+}
+
+void sensorReadTask(void *pvParameters) {
+    ESP_LOGI(TAG_SYSTEM, "Sensor read task started");
+    
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while (1) {
+        // Update all sensors
+        g_mpu6500.setDataMutex(g_data_sensor_mutex);
+        g_mpu6500.update();
+        
+        g_ads1115.setDataMutex(g_data_sensor_mutex);
+        g_ads1115.update();
+        
+        g_speed_sensor.setDataMutex(g_data_sensor_mutex);
+        g_speed_sensor.update();
+        
+        // Update system status
+        if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(10))) {
+            g_data_sensor.status.heap_free = esp_get_free_heap_size();
+            g_data_sensor.status.uptime_ms = millis();
+            g_data_sensor.last_update_ms = millis();
+            xSemaphoreGive(g_data_sensor_mutex);
+        }
+        
+        // Block for periodic update
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(SENSOR_READ_DELAY_MS));
+    }
+    
+    vTaskDelete(nullptr);
+}
+
+// ============================================================================
+// SYSTEM INITIALIZATION
+// ============================================================================
+
+void initializeSystems() {
+    ESP_LOGI(TAG_SYSTEM, "=== Initializing DAQ System ===");
+    
+    // Create mutex for global data structure
+    g_data_sensor_mutex = xSemaphoreCreateMutex();
+    if (g_data_sensor_mutex == nullptr) {
+        ESP_LOGE(TAG_SYSTEM, "Failed to create data sensor mutex");
+        return;
+    }
+    
+    // Initialize sensors
+    ESP_LOGI(TAG_SYSTEM, "Initializing sensors...");
+    if (!g_mpu6500.init()) {
+        ESP_LOGE(TAG_SYSTEM, "MPU6500 initialization failed");
+    }
+    
+    // Configure I2C clock speed (from JouleMeterTest pattern)
+    Wire.setClock(400000);  // 400kHz I2C speed for ADS1115 and other I2C devices
+    
+    if (!g_ads1115.init()) {
+        ESP_LOGE(TAG_SYSTEM, "ADS1115 initialization failed");
+    }
+    
+    if (!g_speed_sensor.init()) {
+        ESP_LOGE(TAG_SYSTEM, "Speed sensor initialization failed");
+    }
+    
+    // Initialize GPS
+    ESP_LOGI(TAG_SYSTEM, "Initializing GPS...");
+    if (!g_gps_manager.init()) {
+        ESP_LOGE(TAG_SYSTEM, "GPS initialization failed");
+    }
+    
+    // Initialize CAN bus
+    ESP_LOGI(TAG_SYSTEM, "Initializing CAN bus...");
+    if (!g_can_manager.init()) {
+        ESP_LOGE(TAG_SYSTEM, "CAN bus initialization failed");
+    }
+    
+    // Initialize WiFi
+    ESP_LOGI(TAG_SYSTEM, "Initializing WiFi...");
+    if (!g_wifi_manager.init()) {
+        ESP_LOGE(TAG_SYSTEM, "WiFi initialization failed");
+    }
+    
+    // Connect to WiFi (non-blocking)
+    g_wifi_manager.connect();
+    
+    ESP_LOGI(TAG_SYSTEM, "System initialization complete!");
+}
+
+// ============================================================================
+// CREATE FREERTOS TASKS
+// ============================================================================
+
+void createTasks() {
+    ESP_LOGI(TAG_SYSTEM, "Creating FreeRTOS tasks...");
+    
+    // Sensor read task (high priority, app CPU)
+    xTaskCreatePinnedToCore(
+        sensorReadTask,           // Task function
+        "SensorReadTask",         // Task name
+        TASK_STACK_SIZE,          // Stack size
+        nullptr,                  // Parameters
+        TASK_PRIORITY,            // Priority
+        &g_sensor_task_handle,    // Task handle
+        APP_CPU_NUM               // CPU core
+    );
+    
+    // GPS task (medium priority, app CPU)
+    xTaskCreatePinnedToCore(
+        gpsTask,
+        "GPSTask",
+        TASK_STACK_SIZE * 2,      // GPS needs more stack
+        nullptr,
+        GPS_TASK_PRIORITY,
+        &g_gps_task_handle,
+        APP_CPU_NUM
+    );
+    
+    // CAN RX task (high priority, app CPU)
+    xTaskCreatePinnedToCore(
+        canRxTask,
+        "CANRxTask",
+        TASK_STACK_SIZE,
+        nullptr,
+        CAN_TASK_PRIORITY,
+        &g_can_rx_task_handle,
+        APP_CPU_NUM
+    );
+    
+    // CAN TX task (medium priority, app CPU)
+    xTaskCreatePinnedToCore(
+        canTxTask,
+        "CANTxTask",
+        TASK_STACK_SIZE,
+        nullptr,
+        CAN_TASK_PRIORITY - 1,
+        &g_can_tx_task_handle,
+        APP_CPU_NUM
+    );
+    
+    // WiFi task (low priority, pro CPU to not interfere with real-time tasks)
+    xTaskCreatePinnedToCore(
+        wifiTask,
+        "WiFiTask",
+        TASK_STACK_SIZE * 2,      // WiFi needs more stack
+        nullptr,
+        WIFI_TASK_PRIORITY,
+        &g_wifi_task_handle,
+        PRO_CPU_NUM               // Run on PRO CPU
+    );
+    
+    ESP_LOGI(TAG_SYSTEM, "All tasks created successfully");
+}
+
+// ============================================================================
+// SETUP (Called once at startup)
+// ============================================================================
+
+void setup() {
+    // Initialize serial for logging
+    Serial.begin(115200);
+    delay(500);
+    
+    ESP_LOGI(TAG_SYSTEM, "\n\n===========================================");
+    ESP_LOGI(TAG_SYSTEM, "SMV Data Acquisition Board");
+    ESP_LOGI(TAG_SYSTEM, "Initializing...");
+    ESP_LOGI(TAG_SYSTEM, "===========================================\n");
+    //scan I2C bus for debugging
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
+    ESP_LOGI(TAG_SYSTEM, "Scanning I2C bus for devices...");
+    byte error, address;
+    int nDevices = 0;
+    for(address = 1; address < 127; address++ ) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        if (error == 0) {
+            ESP_LOGI(TAG_SYSTEM, "I2C device found at address 0x%02X", address);
+            nDevices++;
+        }
+    }
+    if (nDevices == 0) {
+        ESP_LOGI(TAG_SYSTEM, "No I2C devices found");
+    } else {
+        ESP_LOGI(TAG_SYSTEM, "Total I2C devices found: %d", nDevices);
+    }
+
+    //initBLE
+    initBLE();
+    
+    // Initialize all systems
+    initializeSystems();
+    
+    // Create FreeRTOS tasks
+    createTasks();
+    
+    ESP_LOGI(TAG_SYSTEM, "Setup complete! Starting main loop...");
+}
+
+// ============================================================================
+// LOOP (Main loop running on core 0)
+// ============================================================================
+
+void loop() {
+    // Monitor system health every 5 seconds
+    static volatile uint32_t last_log_time = 0;
+    
+    if (millis() - last_log_time >= 5000) {
+        last_log_time = millis();
+        
+        // Log system status
+        ESP_LOGI(TAG_SYSTEM, "--- System Status ---");
+        ESP_LOGI(TAG_SYSTEM, "Uptime: %ld ms", millis());
+        ESP_LOGI(TAG_SYSTEM, "Free heap: %d bytes", esp_get_free_heap_size());
+        
+        if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(100))) {
+            // Log sensor data if valid
+            if (g_data_sensor.flags.mpu6500_valid) {
+                ESP_LOGI(TAG_SYSTEM, "MPU6500: Accel(%.2f, %.2f, %.2f) m/s², Temp: %.1f°C",
+                    g_data_sensor.mpu6500.accel.x,
+                    g_data_sensor.mpu6500.accel.y,
+                    g_data_sensor.mpu6500.accel.z,
+                    g_data_sensor.mpu6500.temperature);
+            }
+            
+            if (g_data_sensor.flags.ads1115_valid) {
+                ESP_LOGI(TAG_SYSTEM, "ADS1115: Voltage: %.2fV, Current: %.3fA",
+                    g_data_sensor.ads1115.voltage,
+                    g_data_sensor.ads1115.current);
+            }
+            
+            if (g_data_sensor.flags.speed_valid) {
+                ESP_LOGI(TAG_SYSTEM, "Speed: %.2f km/h, Pulses: %ld",
+                    g_data_sensor.speed.speed_kmh,
+                    g_data_sensor.speed.pulse_count);
+            }
+            
+            if (g_data_sensor.flags.gps_valid) {
+                ESP_LOGI(TAG_SYSTEM, "GPS: Lat: %.6f, Lon: %.6f, Sats: %d, Speed: %.1f km/h",
+                    g_data_sensor.gps.latitude,
+                    g_data_sensor.gps.longitude,
+                    g_data_sensor.gps.satellites,
+                    g_data_sensor.gps.speed_kmh);
+            }
+            
+            ESP_LOGI(TAG_SYSTEM, "WiFi: %s, CAN: %s",
+                g_data_sensor.status.wifi_connected ? "Connected" : "Disconnected",
+                g_can_manager.isInitialized() ? "Active" : "Inactive");
+            
+            xSemaphoreGive(g_data_sensor_mutex);
+        }
+    }
+
+    //BLE notification wth 100ms interval
+    static uint32_t last_ble_time = 0;
+    if(millis() - last_ble_time >= 50)
+    {
+        last_ble_time = millis();
+        if (deviceConnected)
+        {
+            pCharacteristic->setValue((uint8_t*)&g_data_sensor, sizeof(g_data_sensor));
+            pCharacteristic->notify();
+        }
+    
+    }
+    
+    // Blink LED to show system is running
+    static uint32_t last_blink_time = 0;
+    static bool led_state = false;
+    
+    if (millis() - last_blink_time >= (led_state ? LED_ON_MS : LED_OFF_MS)) {
+        led_state = !led_state;
+        digitalWrite(LED_PIN, led_state ? HIGH : LOW);
+        last_blink_time = millis();
+    }
+    
+    delay(100);
+}
