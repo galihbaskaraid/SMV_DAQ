@@ -29,6 +29,10 @@ public:
 private:
     void parseGPRMC(const char* sentence);  // $GPRMC parsing
     void parseGPGGA(const char* sentence);  // $GPGGA parsing
+    void parseGPVTG(const char* sentence);  // $GPVTG parsing
+    void parseGPGSA(const char* sentence);  // $GPGSA parsing
+    void parseGPGLL(const char* sentence);  // $GPGLL parsing
+    void parseGPGSV(const char* sentence);  // $GPGSV parsing
     float parseCoordinate(const char* coord, const char* direction);
     bool parseTime(const char* time_str, char* utc_time);
     bool parseDate(const char* date_str, char* utc_date);

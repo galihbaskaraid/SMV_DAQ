@@ -5,6 +5,12 @@
 #include <time.h>
 
 // ============================================================================
+// FORCE TIGHT PACKING - NO PADDING/ALIGNMENT
+// ============================================================================
+// Critical for BLE serialization consistency between ESP32 and Android
+#pragma pack(push, 1)
+
+// ============================================================================
 // SENSOR DATA STRUCTURES
 // ============================================================================
 
@@ -35,8 +41,13 @@ typedef struct {
     float speed_kts;        // Speed (knots)
     float speed_kmh;        // Speed (km/h)
     float course;           // Course (degrees)
-    uint8_t satellites;     // Number of satellites
+    float hdop;             // Horizontal Dilution of Precision
+    float vdop;             // Vertical Dilution of Precision
+    float pdop;             // Position Dilution of Precision
+    uint8_t satellites;     // Number of satellites in view
+    uint8_t satellites_active;  // Number of satellites used for fix
     uint8_t fix_quality;    // GPS fix quality (0=invalid, 1=GPS fix, 2=DGPS fix)
+    uint8_t fix_type;       // Fix type (1=2D, 3=3D)
     uint32_t timestamp_ms;  // Millisecond timestamp
     char utc_time[12];      // UTC time (hhmmss.ss)
     char utc_date[7];       // UTC date (ddmmyy)
@@ -60,6 +71,39 @@ typedef struct {
 } CANData_t;
 
 typedef struct {
+    float temperature;      // Temperature from sensor (°C)
+    float humidity;         // Humidity from sensor (%)
+    uint32_t timestamp_ms;  // Millisecond timestamp
+} EnvData_t;
+
+typedef struct {
+    float power;            // Calculated power (W) = voltage × current
+    float energy;           // Energy consumed (kJ)
+    float energy_kwh;       // Energy consumed (kWh)
+    float consumption_rate; // Consumption rate (Wh/km)
+    float avg_speed_kmh;    // Average speed (km/h)
+    float total_distance_m; // Total distance traveled (m)
+    uint32_t total_time_ms; // Total driving time (ms)
+    int current_gear;       // Current gear detection (from RPM ratio)
+    float smoothed_gear_ratio; // Smoothed gear ratio for filtering
+    int drive_status;       // 0=idle, 1=pulling, 2=gliding
+    float pull_duration_s;  // Pull duration (seconds)
+    float glide_duration_s; // Glide duration (seconds)
+    uint32_t timestamp_ms;  // Millisecond timestamp
+} CalcData_t;
+
+typedef struct {
+    float rpm;              // Motor RPM from VESC
+    float motor_current;    // Motor current (A)
+    float duty_cycle;       // Duty cycle (%)
+    float temp_fet;         // FET temperature (°C)
+    float v_in;             // Input voltage (V)
+    float amp_hours;        // Amp hours
+    float watt_hours;       // Watt hours
+    uint32_t timestamp_ms;  // Millisecond timestamp
+} VESCData_t;
+
+typedef struct {
     uint8_t battery_percent;
     float battery_voltage;
     float mcu_temperature;
@@ -75,24 +119,41 @@ typedef struct {
 // MAIN DATA SENSOR STRUCTURE (Thread-Safe Access)
 // ============================================================================
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     // Sensor data
     MPU6500Data_t mpu6500;
     ADS1115Data_t ads1115;
     GPSData_t gps;
     SpeedData_t speed;
     CANData_t can_rx;
+    EnvData_t env;          // Temperature/Humidity data
+    CalcData_t calc;        // Calculated/processed data
+    VESCData_t vesc;        // VESC motor controller data
     
     // System status
     SystemStatus_t status;
     
     // Data validity flags
     struct {
+        // Sensor validity (data is valid/recently updated)
         bool mpu6500_valid;
         bool ads1115_valid;
         bool gps_valid;
         bool speed_valid;
         bool can_valid;
+        bool env_valid;
+        bool calc_valid;
+        bool vesc_valid;
+        
+        // Sensor initialization status (sensor is present and initialized)
+        bool mpu6500_init;
+        bool ads1115_init;
+        bool gps_init;
+        bool speed_init;
+        bool can_init;
+        bool env_init;
+        bool wifi_init;
+        bool ble_init;
     } flags;
     
     // Timestamp of last update
@@ -104,5 +165,10 @@ typedef struct __attribute__((packed)) {
 // EXTERN GLOBAL VARIABLE (Accessed by all tasks)
 // ============================================================================
 extern DataSensor_t g_data_sensor;
+
+// ============================================================================
+// END TIGHT PACKING
+// ============================================================================
+#pragma pack(pop)
 
 #endif // DATA_SENSOR_H

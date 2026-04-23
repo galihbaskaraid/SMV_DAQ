@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 #include "constants.h"
+#include "debug_logging.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -25,7 +26,7 @@ bool WiFiManager::init() {
     WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
     
-    ESP_LOGI(TAG_WIFI, "WiFi manager initialized");
+    WIFI_LOGI(TAG_WIFI, "WiFi manager initialized");
     initialized = true;
     return true;
 }
@@ -40,11 +41,11 @@ void WiFiManager::deinit() {
 
 bool WiFiManager::connect() {
     if (!initialized) {
-        ESP_LOGE(TAG_WIFI, "WiFi manager not initialized");
+        WIFI_LOGE(TAG_WIFI, "WiFi manager not initialized");
         return false;
     }
     
-    ESP_LOGI(TAG_WIFI, "Connecting to WiFi: %s", WIFI_SSID);
+    WIFI_LOGI(TAG_WIFI, "Connecting to WiFi: %s", WIFI_SSID);
     
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
@@ -62,11 +63,11 @@ bool WiFiManager::connect() {
     
     if (WiFi.status() == WL_CONNECTED) {
         connected = true;
-        ESP_LOGI(TAG_WIFI, "WiFi connected! IP: %s", WiFi.localIP().toString().c_str());
+        WIFI_LOGI(TAG_WIFI, "WiFi connected! IP: %s", WiFi.localIP().toString().c_str());
         return true;
     } else {
         connected = false;
-        ESP_LOGE(TAG_WIFI, "Failed to connect to WiFi after %d retries", WIFI_MAX_RETRY);
+        WIFI_LOGE(TAG_WIFI, "Failed to connect to WiFi after %d retries", WIFI_MAX_RETRY);
         return false;
     }
 }
@@ -74,7 +75,7 @@ bool WiFiManager::connect() {
 void WiFiManager::disconnect() {
     WiFi.disconnect(true);  // true = turn off WiFi radio
     connected = false;
-    ESP_LOGI(TAG_WIFI, "WiFi disconnected");
+    WIFI_LOGI(TAG_WIFI, "WiFi disconnected");
 }
 
 bool WiFiManager::createJSONPayload(const DataSensor_t &sensor_data, 
@@ -137,7 +138,7 @@ bool WiFiManager::createJSONPayload(const DataSensor_t &sensor_data,
     size_t written = serializeJson(doc, json_buffer, buffer_size);
     
     if (written == 0) {
-        ESP_LOGE(TAG_HTTP, "JSON serialization failed");
+        HTTP_LOGE(TAG_HTTP, "JSON serialization failed");
         return false;
     }
     
@@ -146,7 +147,7 @@ bool WiFiManager::createJSONPayload(const DataSensor_t &sensor_data,
 
 bool WiFiManager::performHTTPPost(const char* json_data) {
     if (!connected) {
-        ESP_LOGW(TAG_HTTP, "WiFi not connected");
+        HTTP_LOGW(TAG_HTTP, "WiFi not connected");
         return false;
     }
     
@@ -161,16 +162,16 @@ bool WiFiManager::performHTTPPost(const char* json_data) {
     int http_response_code = http.POST(json_data);
     
     if (http_response_code > 0) {
-        ESP_LOGI(TAG_HTTP, "HTTP Response: %d", http_response_code);
+        HTTP_LOGI(TAG_HTTP, "HTTP Response: %d", http_response_code);
         
         if (http_response_code == HTTP_CODE_OK) {
             String response = http.getString();
-            ESP_LOGD(TAG_HTTP, "Response: %s", response.c_str());
+            HTTP_LOGD(TAG_HTTP, "Response: %s", response.c_str());
             http.end();
             return true;
         }
     } else {
-        ESP_LOGE(TAG_HTTP, "HTTP POST failed, error: %s", http.errorToString(http_response_code).c_str());
+        HTTP_LOGE(TAG_HTTP, "HTTP POST failed, error: %s", http.errorToString(http_response_code).c_str());
     }
     
     http.end();
@@ -185,11 +186,11 @@ bool WiFiManager::sendDataViaHTTP(const DataSensor_t &sensor_data) {
     static char json_buffer[JSON_BUFFER_SIZE];
     
     if (!createJSONPayload(sensor_data, json_buffer, sizeof(json_buffer))) {
-        ESP_LOGE(TAG_HTTP, "Failed to create JSON payload");
+        HTTP_LOGE(TAG_HTTP, "Failed to create JSON payload");
         return false;
     }
     
-    ESP_LOGD(TAG_HTTP, "JSON: %s", json_buffer);
+    HTTP_LOGD(TAG_HTTP, "JSON: %s", json_buffer);
     
     return performHTTPPost(json_buffer);
 }
@@ -199,14 +200,14 @@ bool WiFiManager::sendDataViaHTTP(const DataSensor_t &sensor_data) {
 // ============================================================================
 
 void wifiTask(void *pvParameters) {
-    ESP_LOGI(TAG_WIFI, "WiFi task started");
+    WIFI_LOGI(TAG_WIFI, "WiFi task started");
     
     uint32_t last_post_time = 0;
     
     while (1) {
         // Check WiFi connection status
         if (WiFi.status() != WL_CONNECTED) {
-            ESP_LOGW(TAG_WIFI, "WiFi disconnected, attempting to reconnect...");
+            WIFI_LOGW(TAG_WIFI, "WiFi disconnected, attempting to reconnect...");
             g_wifi_manager.connect();
         }
         
@@ -214,7 +215,7 @@ void wifiTask(void *pvParameters) {
         uint32_t current_time = millis();
         if (current_time - last_post_time >= HTTP_POST_INTERVAL_MS) {
             if (g_wifi_manager.sendDataViaHTTP(g_data_sensor)) {
-                ESP_LOGI(TAG_HTTP, "Data sent successfully");
+                HTTP_LOGI(TAG_HTTP, "Data sent successfully");
                 last_post_time = current_time;
             }
         }

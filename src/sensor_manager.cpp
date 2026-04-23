@@ -1,8 +1,10 @@
 #include "sensor_manager.h"
 #include "constants.h"
+#include "debug_logging.h"
 #include <MPU9250_WE.h>
 #include <Adafruit_ADS1X15.h>
 #include <Wire.h>
+#include <cmath>
 
 // Critical section macro for interrupt safety
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -31,12 +33,12 @@ MPU6500Manager::~MPU6500Manager() {
 
 bool MPU6500Manager::init() {
     if (!Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ)) {
-        ESP_LOGE(TAG_SENSOR, "I2C initialization failed");
+        I2C_LOGE(TAG_SENSOR, "I2C initialization failed");
         return false;
     }
     
     if (!mpu6500.init()) {
-        ESP_LOGE(TAG_SENSOR, "MPU6500 initialization failed");
+        I2C_LOGE(TAG_SENSOR, "MPU6500 initialization failed");
         return false;
     }
     
@@ -49,7 +51,7 @@ bool MPU6500Manager::init() {
     mpu6500.enableAccDLPF(true);
     mpu6500.setAccDLPF(MPU9250_DLPF_6);
     
-    ESP_LOGI(TAG_SENSOR, "MPU6500 initialized successfully");
+    I2C_LOGI(TAG_SENSOR, "MPU6500 initialized successfully");
     initialized = true;
     return true;
 }
@@ -112,18 +114,18 @@ ADS1115Manager::~ADS1115Manager() {
 
 bool ADS1115Manager::init() {
     if (!ads.begin(ADS1115_ADDRESS)) {
-        ESP_LOGE(TAG_SENSOR, "ADS1115 initialization failed");
+        I2C_LOGE(TAG_SENSOR, "ADS1115 initialization failed");
         return false;
     }
     
     // Configure gain and sample rate (from JouleMeterTest pattern)
-    ads.setGain(GAIN_ONE);  // 1x gain ±4.096V range
-    ads.setDataRate(RATE_ADS1115_860SPS);  // 860 samples per second
+    ads.setGain(GAIN_TWOTHIRDS);  // 1x gain ±4.096V range
+    ads.setDataRate(RATE_ADS1115_475SPS);  // 475 samples per second
     
     // Perform calibration for current sensor offset
     calibrateCurrentSensor();
     
-    ESP_LOGI(TAG_SENSOR, "ADS1115 initialized successfully");
+    I2C_LOGI(TAG_SENSOR, "ADS1115 initialized successfully");
     initialized = true;
     return true;
 }
@@ -162,11 +164,11 @@ void ADS1115Manager::calibrateCurrentSensor() {
     float min_val = 4096.0f;
     float max_val = 0;
     
-    ESP_LOGI(TAG_SENSOR, "Starting ADS1115 calibration (500 samples)...");
+    I2C_LOGI(TAG_SENSOR, "Starting ADS1115 calibration (500 samples)...");
     
     // Take 500 samples with minimal delay between them
     for (int i = 0; i < 500; i++) {
-        int16_t adc_raw = ads.readADC_SingleEnded(1);  // Read current channel (AIN1)
+        int16_t adc_raw = ads.readADC_SingleEnded(0);  // Read current channel (AIN0)
         float adc_voltage_v = ads.computeVolts(adc_raw);
         float adc_voltage_mv = adc_voltage_v * 1000.0f;
         
@@ -181,11 +183,11 @@ void ADS1115Manager::calibrateCurrentSensor() {
     current_offset_mv = current_sum / 500.0f;
     float noise_window = max_val - min_val;
     
-    ESP_LOGI(TAG_SENSOR, "Calibration complete:");
-    ESP_LOGI(TAG_SENSOR, "  Offset (0A reference): %.3f mV", current_offset_mv);
-    ESP_LOGI(TAG_SENSOR, "  Min value: %.3f mV", min_val);
-    ESP_LOGI(TAG_SENSOR, "  Max value: %.3f mV", max_val);
-    ESP_LOGI(TAG_SENSOR, "  Noise window: %.3f mV", noise_window);
+    I2C_LOGI(TAG_SENSOR, "Calibration complete:");
+    I2C_LOGI(TAG_SENSOR, "  Offset (0A reference): %.3f mV", current_offset_mv);
+    I2C_LOGI(TAG_SENSOR, "  Min value: %.3f mV", min_val);
+    I2C_LOGI(TAG_SENSOR, "  Max value: %.3f mV", max_val);
+    I2C_LOGI(TAG_SENSOR, "  Noise window: %.3f mV", noise_window);
 }
 
 void ADS1115Manager::update() {
@@ -194,7 +196,7 @@ void ADS1115Manager::update() {
     ADS1115Data_t data;
     
     // Read voltage from AIN0 (with voltage divider) - from JouleMeterTest pattern
-    int16_t adc0 = ads.readADC_SingleEnded(0);
+    int16_t adc0 = ads.readADC_SingleEnded(1);  // Read voltage channel (AIN1)
     data.raw_adc[0] = adc0;
     float voltage_adc_v = ads.computeVolts(adc0);
     
@@ -209,8 +211,8 @@ void ADS1115Manager::update() {
         data.voltage = 0;
     }
     
-    // Read current from AIN1 (with AD8418 amplifier and shunt) - from JouleMeterTest
-    int16_t adc1 = ads.readADC_SingleEnded(1);
+    // Read current from AIN0 (with AD8418 amplifier and shunt) - from JouleMeterTest
+    int16_t adc1 = ads.readADC_SingleEnded(0);
     data.raw_adc[1] = adc1;
     float current_adc_v = ads.computeVolts(adc1);
     float current_adc_mv = current_adc_v * 1000.0f;
@@ -237,14 +239,43 @@ bool ADS1115Manager::getData(ADS1115Data_t &data) {
 }
 
 // ============================================================================
-// SPEED SENSOR IMPLEMENTATION
+// SPEED SENSOR IMPLEMENTATION (from JM_01122025 working algorithm)
 // ============================================================================
 
-// Speed Sensor Interrupt Service Routine
+// Volatile variables for ISR (pulse interval tracking - HIGH edge detection)
+static volatile unsigned long pulseIntervalMicros = 0;
+static volatile unsigned long lastPulseTimestampMicros = 0;
+static volatile bool waiting_for_first_valid_pulse = true;
+static volatile unsigned long last_processed_pulse_ts = 0;
+
+// Speed Sensor Interrupt Service Routine - Detects HIGH edge (rising edge)
 void IRAM_ATTR speedSensorISR(void *arg) {
-    portENTER_CRITICAL_ISR(&mux);
-    g_speed_sensor.handlePulse();
-    portEXIT_CRITICAL_ISR(&mux);
+    // Only process if transition is LOW -> HIGH (rising edge)
+    if (digitalRead(SPEED_SENSOR_PIN) == HIGH) {
+        unsigned long now_us = micros();
+        
+        portENTER_CRITICAL_ISR(&mux);
+        unsigned long last_ts = lastPulseTimestampMicros;
+        portEXIT_CRITICAL_ISR(&mux);
+
+        // Filter debounce/max speed basic
+        if ((now_us - last_ts) < MIN_PULSE_INTERVAL_MICROS) {
+            return;
+        }
+        
+        unsigned long interval = now_us - last_ts;
+        
+        portENTER_CRITICAL_ISR(&mux);
+        pulseIntervalMicros = interval;
+        lastPulseTimestampMicros = now_us;
+        portEXIT_CRITICAL_ISR(&mux);
+    }
+}
+
+// Inline function to calculate speed from pulse interval (from JM project)
+inline float speed_from_interval(unsigned long interval_us) {
+    if (interval_us == 0) return 0.0f;
+    return ((1e6f / interval_us) / PPR) * WHEEL_CIRCUMFERENCE_M * 3.6f;
 }
 
 SpeedSensorManager::SpeedSensorManager()
@@ -262,9 +293,11 @@ SpeedSensorManager::~SpeedSensorManager() {
 bool SpeedSensorManager::init() {
     pinMode(SPEED_SENSOR_PIN, INPUT_PULLUP);
     attachInterruptArg(digitalPinToInterrupt(SPEED_SENSOR_PIN), 
-                       speedSensorISR, nullptr, SPEED_SENSOR_INTERRUPT);
+                       speedSensorISR, nullptr, CHANGE);
     
-    ESP_LOGI(TAG_SENSOR, "Speed sensor initialized on pin %d", SPEED_SENSOR_PIN);
+    SENSOR_LOGI(TAG_SENSOR, "Speed sensor initialized on pin %d with HIGH edge detection", SPEED_SENSOR_PIN);
+    SENSOR_LOGI(TAG_SENSOR, "Config: PPR=%.0f, Wheel=%.2fm, Max=%.0f km/h, Interval=%ldms",
+             PPR, WHEEL_CIRCUMFERENCE_M, SPEED_MAX_KMH, SPEED_CALC_INTERVAL_MS);
     initialized = true;
     return true;
 }
@@ -291,28 +324,121 @@ void SpeedSensorManager::update() {
     SpeedData_t data;
     uint32_t current_time = millis();
     
-    // Calculate speed from pulse frequency - from JouleMeterTest pattern
+    // Blended speed calculation (from JM_01122025) - HIGH accuracy algorithm
     static uint32_t last_calc_time = 0;
-    const uint32_t calc_interval_ms = 500;  // Calculate every 500ms
+    static float filtered_speed_ema = 0.0f;
+    static unsigned long validation_memory_us = 0;
     
-    if (current_time - last_calc_time >= calc_interval_ms) {
+    if (current_time - last_calc_time >= SPEED_CALC_INTERVAL_MS) {
+        uint32_t delta_time_ms = current_time - last_calc_time;
+        last_calc_time = current_time;
+
+        // Get latest pulse interval data safely
         portENTER_CRITICAL(&mux);
-        uint32_t count = pulse_count;
-        pulse_count = 0;
+        unsigned long local_last_ts = lastPulseTimestampMicros;
+        unsigned long local_interval = pulseIntervalMicros;
         portEXIT_CRITICAL(&mux);
+
+        // Check if we have a new pulse since last calculation
+        bool has_new_pulse = (local_last_ts > last_processed_pulse_ts);
+        unsigned long interval_for_calc = 0;
+
+        if (has_new_pulse) {
+            last_processed_pulse_ts = local_last_ts;
+            if (waiting_for_first_valid_pulse) {
+                // First pulse, skip calculation to establish baseline
+                interval_for_calc = 0;
+                validation_memory_us = 0;
+                waiting_for_first_valid_pulse = false;
+            } else {
+                // Validate interval against previous to filter outliers
+                unsigned long validated_interval = local_interval;
+                
+                if (validation_memory_us > 0) {
+                    // Check for unrealistic acceleration (misspulse)
+                    if (validated_interval < validation_memory_us * ACCEL_VALIDATION_FACTOR) {
+                        // Interval suddenly too short → likely misspulse, reject
+                        validated_interval = validation_memory_us;
+                    } else if (validated_interval > validation_memory_us * MISSPULSE_FACTOR) {
+                        // Interval suddenly too long → likely misspulse, divide by 2
+                        validated_interval /= 2;
+                    }
+                }
+                interval_for_calc = validated_interval;
+            }
+            validation_memory_us = local_interval;
+        } else {
+            // No new pulse since last check
+            if (current_time > (last_processed_pulse_ts / 1000) + SPEED_FREEZE_DURATION_MS) {
+                // Timeout reached, freeze speed
+                interval_for_calc = 0;
+                validation_memory_us = 0;
+                waiting_for_first_valid_pulse = true;
+            } else {
+                // Still within timeout, keep using last interval
+                interval_for_calc = validation_memory_us;
+            }
+        }
+
+        // Calculate blended speed (interval-based + counter-based)
+        float v_blended;
+        if (interval_for_calc == 0) {
+            v_blended = 0.0f;
+        } else {
+            // Interval-based speed (faster response, less noise at high speeds)
+            float v_interval = speed_from_interval(interval_for_calc);
+            
+            // Counter-based speed (accumulated pulses in interval - smoother at low speeds)
+            float v_counter = 0.0f;
+            if (delta_time_ms > 0 && pulse_count > 0) {
+                v_counter = (((float)pulse_count / (delta_time_ms / 1000.0f)) / PPR) * WHEEL_CIRCUMFERENCE_M * 3.6f;
+            } else {
+                v_counter = v_interval;
+            }
+            
+            // Blend based on speed range (smooth at low speed, interval-based at high speed)
+            const float LOW_SPEED_THRESH_KMH = 8.0f;
+            const float HIGH_SPEED_THRESH_KMH = 20.0f;
+            float w = (v_interval <= LOW_SPEED_THRESH_KMH) ? 0.0f : 
+                      (v_interval >= HIGH_SPEED_THRESH_KMH) ? 1.0f :
+                      (v_interval - LOW_SPEED_THRESH_KMH) / (HIGH_SPEED_THRESH_KMH - LOW_SPEED_THRESH_KMH);
+            v_blended = (1.0f - w) * v_interval + w * v_counter;
+        }
         
-        // Calculate speed based on wheel parameters
-        // speed = (pulses / pulses_per_revolution) * wheel_circumference (m) / time (s) * 3.6 -> km/h
-        float distance_m = (float)count / PULSES_PER_REVOLUTION * (WHEEL_CIRCUMFERENCE_MM);
-        float raw_speed_kmh = (distance_m / (calc_interval_ms / 1000.0f)) * 3.6f;
+        // Apply EMA (Exponential Moving Average) filtering with adaptive alpha
+        if (v_blended == 0.0f) {
+            filtered_speed_ema = 0.0f;
+        } else {
+            float alpha;
+            float delta_speed = fabs(v_blended - filtered_speed_ema);
+            
+            if (delta_speed > HIGH_ACCEL_THRESHOLD_KMH) {
+                // High acceleration detected → use responsive filter
+                alpha = ALPHA_RESPONSIVE;
+            } else if (delta_speed < STABLE_SPEED_THRESHOLD_KMH) {
+                // Stable speed → use smooth filter
+                alpha = ALPHA_SMOOTH;
+            } else {
+                // Normal acceleration → use default filter
+                alpha = ALPHA_DEFAULT;
+            }
+            
+            filtered_speed_ema = (1.0f - alpha) * filtered_speed_ema + alpha * v_blended;
+        }
+
+        // Final speed with hysteresis to eliminate noise at 0
+        float final_speed = (filtered_speed_ema < 0.2f) ? 0.0f : filtered_speed_ema;
         
-        data.speed_kmh = filterSpeed(raw_speed_kmh);
+        data.speed_kmh = final_speed;
         data.speed_ms = data.speed_kmh / 3.6f;
-        data.pulse_count = count;
-        data.last_pulse_us = last_pulse_time;
+        data.pulse_count = pulse_count;
+        data.last_pulse_us = lastPulseTimestampMicros;
         data.timestamp_ms = current_time;
         
-        last_calc_time = current_time;
+        // Reset pulse counter for next interval
+        portENTER_CRITICAL(&mux);
+        pulse_count = 0;
+        portEXIT_CRITICAL(&mux);
         
         if (data_mutex != nullptr && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100))) {
             g_data_sensor.speed = data;

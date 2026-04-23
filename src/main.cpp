@@ -7,11 +7,15 @@
 
 // Include all managers
 #include "constants.h"
+#include "debug_logging.h"
 #include "data_sensor.h"
 #include "sensor_manager.h"
+#include "data_calc.h"
+#include "ble_serialize.h"
 #include "gps_manager.h"
 #include "can_manager.h"
 #include "wifi_manager.h"
+#include "struct_offsets.h"
 
 //BLE
 #include <BLEDevice.h>
@@ -49,23 +53,23 @@ TaskHandle_t g_wifi_task_handle = nullptr;
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
-        
-        ESP_LOGI(TAG_SYSTEM, "BLE Client connected");
+
+        BLE_LOGI(TAG_SYSTEM, "BLE Client connected");
     }
 
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
-        ESP_LOGI(TAG_SYSTEM, "BLE Client disconnected");
+        BLE_LOGI(TAG_SYSTEM, "BLE Client disconnected");
         pServer->startAdvertising();
     }
 };
 
 void initBLE()
 {
-    ESP_LOGI(TAG_SYSTEM, "Initializing BLE...");
+    BLE_LOGI(TAG_SYSTEM, "Initializing BLE...");
     
     BLEDevice::init("DAQ_SYSTEM");
-    BLEDevice::setMTU(247);
+    BLEDevice::setMTU(512);
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
 
@@ -84,30 +88,112 @@ void initBLE()
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(false);
     pAdvertising->start();
-    ESP_LOGI(TAG_SYSTEM, "BLE initialized and advertising started");
+    
+    g_data_sensor.flags.ble_init = true;
+    BLE_LOGI(TAG_SYSTEM, "✓ BLE initialized and advertising started");
 }
 
 void sensorReadTask(void *pvParameters) {
-    ESP_LOGI(TAG_SYSTEM, "Sensor read task started");
+    SYSTEM_LOGI(TAG_SYSTEM, "Sensor read task started");
     
     TickType_t last_wake_time = xTaskGetTickCount();
     
     while (1) {
-        // Update all sensors
-        g_mpu6500.setDataMutex(g_data_sensor_mutex);
-        g_mpu6500.update();
+        // Update all sensors (only if initialized)
+        if (g_data_sensor.flags.mpu6500_init) {
+            g_mpu6500.setDataMutex(g_data_sensor_mutex);
+            g_mpu6500.update();
+        }
         
-        g_ads1115.setDataMutex(g_data_sensor_mutex);
-        g_ads1115.update();
+        if (g_data_sensor.flags.ads1115_init) {
+            g_ads1115.setDataMutex(g_data_sensor_mutex);
+            g_ads1115.update();
+        }
         
-        g_speed_sensor.setDataMutex(g_data_sensor_mutex);
-        g_speed_sensor.update();
+        if (g_data_sensor.flags.speed_init) {
+            g_speed_sensor.setDataMutex(g_data_sensor_mutex);
+            g_speed_sensor.update();
+        }
         
-        // Update system status
+        // Read environment sensor (temperature/humidity) - only if initialized
+        if (g_data_sensor.flags.env_init && xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(10))) {
+            if (g_env_sensor.readData(g_data_sensor.env)) {
+                g_data_sensor.flags.env_valid = true;
+            }
+            xSemaphoreGive(g_data_sensor_mutex);
+        }
+        
+        // Perform calculations with mutex protection
         if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(10))) {
+            // ========== PERFORM CALCULATIONS ==========
+            // Calculate power from voltage and current
+            if (g_data_sensor.flags.ads1115_valid) {
+                g_data_calc.calculatePower(
+                    g_data_sensor.ads1115.voltage,
+                    g_data_sensor.ads1115.current,
+                    g_data_sensor.calc
+                );
+                
+                // Calculate energy consumption
+                g_data_calc.calculateEnergy(
+                    g_data_sensor.calc.power,
+                    millis(),
+                    g_data_sensor.calc
+                );
+                
+                // Calculate distance and average speed
+                if (g_data_sensor.flags.speed_valid) {
+                    g_data_calc.calculateDistance(
+                        g_data_sensor.speed.speed_kmh,
+                        millis(),
+                        g_data_sensor.calc
+                    );
+                    
+                    g_data_calc.updateMovingTime(
+                        g_data_sensor.speed.speed_kmh,
+                        millis()
+                    );
+                    
+                    g_data_sensor.calc.avg_speed_kmh = g_data_calc.getAverageSpeed();
+                }
+                
+                // Update drive state (pulling vs gliding)
+                g_data_calc.updateDriveState(
+                    g_data_sensor.ads1115.current,
+                    g_data_sensor.calc
+                );
+                
+                g_data_sensor.flags.calc_valid = true;
+            }
+            
+            // Update system status
             g_data_sensor.status.heap_free = esp_get_free_heap_size();
             g_data_sensor.status.uptime_ms = millis();
             g_data_sensor.last_update_ms = millis();
+            
+            // Update CAN TX data with calculated values
+            if (g_data_sensor.flags.calc_valid) {
+                g_can_manager.setTxData(
+                    g_data_sensor.calc.energy_kwh,                 // energy (kWh)
+                    g_data_sensor.calc.power,                      // power (W)
+                    g_data_sensor.mpu6500.accel.x,                 // anglex (°)
+                    g_data_sensor.mpu6500.accel.y,                 // angley (°)
+                    g_data_sensor.ads1115.voltage,                 // voltage (V)
+                    g_data_sensor.ads1115.current,                 // motor_current (A)
+                    g_data_sensor.ads1115.current,                 // battery_current (A)
+                    g_data_sensor.speed.speed_kmh,                 // speed (km/h)
+                    g_data_sensor.speed.pulse_count,               // wheel_rpm (using pulse count as proxy)
+                    g_data_calc.getMotorRPM(),                     // motor_rpm
+                    g_data_sensor.env.temperature,                 // temp (°C)
+                    g_data_sensor.env.humidity,                    // humidity (%)
+                    (float)g_data_calc.getDetectedGear(),          // gear
+                    g_data_sensor.calc.total_distance_m,           // distance (m)
+                    0.0f,                                          // elevation (m) - from GPS if available
+                    g_data_calc.getPullTimer(),                    // pull_timer (s)
+                    g_data_calc.getGlideTimer()                    // glide_timer (s)
+                );
+            }
+            
             xSemaphoreGive(g_data_sensor_mutex);
         }
         
@@ -123,54 +209,89 @@ void sensorReadTask(void *pvParameters) {
 // ============================================================================
 
 void initializeSystems() {
-    ESP_LOGI(TAG_SYSTEM, "=== Initializing DAQ System ===");
+    SYSTEM_LOGI(TAG_SYSTEM, "=== Initializing DAQ System ===");
     
     // Create mutex for global data structure
     g_data_sensor_mutex = xSemaphoreCreateMutex();
     if (g_data_sensor_mutex == nullptr) {
-        ESP_LOGE(TAG_SYSTEM, "Failed to create data sensor mutex");
+        SYSTEM_LOGE(TAG_SYSTEM, "Failed to create data sensor mutex");
         return;
     }
     
     // Initialize sensors
-    ESP_LOGI(TAG_SYSTEM, "Initializing sensors...");
+    SYSTEM_LOGI(TAG_SYSTEM, "Initializing sensors...");
     if (!g_mpu6500.init()) {
-        ESP_LOGE(TAG_SYSTEM, "MPU6500 initialization failed");
+        SYSTEM_LOGE(TAG_SYSTEM, "MPU6500 initialization failed");
+        g_data_sensor.flags.mpu6500_init = false;
+    } else {
+        g_data_sensor.flags.mpu6500_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ MPU6500 initialized");
     }
     
     // Configure I2C clock speed (from JouleMeterTest pattern)
     Wire.setClock(400000);  // 400kHz I2C speed for ADS1115 and other I2C devices
     
     if (!g_ads1115.init()) {
-        ESP_LOGE(TAG_SYSTEM, "ADS1115 initialization failed");
+        SYSTEM_LOGE(TAG_SYSTEM, "ADS1115 initialization failed");
+        g_data_sensor.flags.ads1115_init = false;
+    } else {
+        g_data_sensor.flags.ads1115_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ ADS1115 initialized");
     }
     
     if (!g_speed_sensor.init()) {
-        ESP_LOGE(TAG_SYSTEM, "Speed sensor initialization failed");
+        SYSTEM_LOGE(TAG_SYSTEM, "Speed sensor initialization failed");
+        g_data_sensor.flags.speed_init = false;
+    } else {
+        g_data_sensor.flags.speed_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ Speed sensor initialized");
+    }
+    
+    // Initialize environment sensor (WSEN_HIDS for temperature/humidity)
+    SYSTEM_LOGI(TAG_SYSTEM, "Initializing environment sensor...");
+    if (!g_env_sensor.init()) {
+        SYSTEM_LOGE(TAG_SYSTEM, "Environment sensor initialization failed (non-critical)");
+        g_data_sensor.flags.env_init = false;
+    } else {
+        g_data_sensor.flags.env_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ Environment sensor (WSEN_HIDS) initialized");
     }
     
     // Initialize GPS
-    ESP_LOGI(TAG_SYSTEM, "Initializing GPS...");
+    SYSTEM_LOGI(TAG_SYSTEM, "Initializing GPS...");
     if (!g_gps_manager.init()) {
-        ESP_LOGE(TAG_SYSTEM, "GPS initialization failed");
+        SYSTEM_LOGE(TAG_SYSTEM, "GPS initialization failed");
+        g_data_sensor.flags.gps_init = false;
+    } else {
+        g_gps_manager.setDataMutex(g_data_sensor_mutex);  // ✓ Give GPS access to shared data
+        g_data_sensor.flags.gps_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ GPS initialized");
     }
     
     // Initialize CAN bus
-    ESP_LOGI(TAG_SYSTEM, "Initializing CAN bus...");
+    SYSTEM_LOGI(TAG_SYSTEM, "Initializing CAN bus...");
     if (!g_can_manager.init()) {
-        ESP_LOGE(TAG_SYSTEM, "CAN bus initialization failed");
+        SYSTEM_LOGE(TAG_SYSTEM, "CAN bus initialization failed");
+        g_data_sensor.flags.can_init = false;
+    } else {
+        g_data_sensor.flags.can_init = true;
+        SYSTEM_LOGI(TAG_SYSTEM, "✓ CAN bus initialized");
     }
     
     // Initialize WiFi
-    ESP_LOGI(TAG_SYSTEM, "Initializing WiFi...");
-    if (!g_wifi_manager.init()) {
-        ESP_LOGE(TAG_SYSTEM, "WiFi initialization failed");
-    }
+    // ESP_LOGI(TAG_SYSTEM, "Initializing WiFi...");
+    // if (!g_wifi_manager.init()) {
+    //     ESP_LOGE(TAG_SYSTEM, "WiFi initialization failed");
+    //     g_data_sensor.flags.wifi_init = false;
+    // } else {
+    //     g_data_sensor.flags.wifi_init = true;
+    //     ESP_LOGI(TAG_SYSTEM, "✓ WiFi initialized");
+    // }
     
     // Connect to WiFi (non-blocking)
-    g_wifi_manager.connect();
+    // g_wifi_manager.connect();
     
-    ESP_LOGI(TAG_SYSTEM, "System initialization complete!");
+    SYSTEM_LOGI(TAG_SYSTEM, "System initialization complete!");
 }
 
 // ============================================================================
@@ -178,7 +299,7 @@ void initializeSystems() {
 // ============================================================================
 
 void createTasks() {
-    ESP_LOGI(TAG_SYSTEM, "Creating FreeRTOS tasks...");
+    SYSTEM_LOGI(TAG_SYSTEM, "Creating FreeRTOS tasks...");
     
     // Sensor read task (high priority, app CPU)
     xTaskCreatePinnedToCore(
@@ -225,17 +346,17 @@ void createTasks() {
     );
     
     // WiFi task (low priority, pro CPU to not interfere with real-time tasks)
-    xTaskCreatePinnedToCore(
-        wifiTask,
-        "WiFiTask",
-        TASK_STACK_SIZE * 2,      // WiFi needs more stack
-        nullptr,
-        WIFI_TASK_PRIORITY,
-        &g_wifi_task_handle,
-        PRO_CPU_NUM               // Run on PRO CPU
-    );
+    // xTaskCreatePinnedToCore(
+    //     wifiTask,
+    //     "WiFiTask",
+    //     TASK_STACK_SIZE * 2,      // WiFi needs more stack
+    //     nullptr,
+    //     WIFI_TASK_PRIORITY,
+    //     &g_wifi_task_handle,
+    //     PRO_CPU_NUM               // Run on PRO CPU
+    // );
     
-    ESP_LOGI(TAG_SYSTEM, "All tasks created successfully");
+    SYSTEM_LOGI(TAG_SYSTEM, "All tasks created successfully");
 }
 
 // ============================================================================
@@ -247,31 +368,34 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     
-    ESP_LOGI(TAG_SYSTEM, "\n\n===========================================");
-    ESP_LOGI(TAG_SYSTEM, "SMV Data Acquisition Board");
-    ESP_LOGI(TAG_SYSTEM, "Initializing...");
-    ESP_LOGI(TAG_SYSTEM, "===========================================\n");
+    SYSTEM_LOGI(TAG_SYSTEM, "\n\n===========================================");
+    SYSTEM_LOGI(TAG_SYSTEM, "SMV Data Acquisition Board");
+    SYSTEM_LOGI(TAG_SYSTEM, "Initializing...");
+    SYSTEM_LOGI(TAG_SYSTEM, "===========================================\n");
     //scan I2C bus for debugging
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
-    ESP_LOGI(TAG_SYSTEM, "Scanning I2C bus for devices...");
+    I2C_LOGI(TAG_SYSTEM, "Scanning I2C bus for devices...");
     byte error, address;
     int nDevices = 0;
     for(address = 1; address < 127; address++ ) {
         Wire.beginTransmission(address);
         error = Wire.endTransmission();
         if (error == 0) {
-            ESP_LOGI(TAG_SYSTEM, "I2C device found at address 0x%02X", address);
+            I2C_LOGI(TAG_SYSTEM, "I2C device found at address 0x%02X", address);
             nDevices++;
         }
     }
     if (nDevices == 0) {
-        ESP_LOGI(TAG_SYSTEM, "No I2C devices found");
+        I2C_LOGI(TAG_SYSTEM, "No I2C devices found");
     } else {
-        ESP_LOGI(TAG_SYSTEM, "Total I2C devices found: %d", nDevices);
+        I2C_LOGI(TAG_SYSTEM, "Total I2C devices found: %d", nDevices);
     }
 
     //initBLE
     initBLE();
+    
+    // Log struct offsets for Android deserializer verification
+    // logStructOffsets();
     
     // Initialize all systems
     initializeSystems();
@@ -279,7 +403,7 @@ void setup() {
     // Create FreeRTOS tasks
     createTasks();
     
-    ESP_LOGI(TAG_SYSTEM, "Setup complete! Starting main loop...");
+    SYSTEM_LOGI(TAG_SYSTEM, "Setup complete! Starting main loop...");
 }
 
 // ============================================================================
@@ -294,14 +418,14 @@ void loop() {
         last_log_time = millis();
         
         // Log system status
-        ESP_LOGI(TAG_SYSTEM, "--- System Status ---");
-        ESP_LOGI(TAG_SYSTEM, "Uptime: %ld ms", millis());
-        ESP_LOGI(TAG_SYSTEM, "Free heap: %d bytes", esp_get_free_heap_size());
+        SYSTEM_LOGI(TAG_SYSTEM, "--- System Status ---");
+        SYSTEM_LOGI(TAG_SYSTEM, "Uptime: %ld ms", millis());
+        SYSTEM_LOGI(TAG_SYSTEM, "Free heap: %d bytes", esp_get_free_heap_size());
         
         if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(100))) {
             // Log sensor data if valid
             if (g_data_sensor.flags.mpu6500_valid) {
-                ESP_LOGI(TAG_SYSTEM, "MPU6500: Accel(%.2f, %.2f, %.2f) m/s², Temp: %.1f°C",
+                SYSTEM_LOGI(TAG_SYSTEM, "MPU6500: Accel(%.2f, %.2f, %.2f) m/s², Temp: %.1f°C",
                     g_data_sensor.mpu6500.accel.x,
                     g_data_sensor.mpu6500.accel.y,
                     g_data_sensor.mpu6500.accel.z,
@@ -309,26 +433,45 @@ void loop() {
             }
             
             if (g_data_sensor.flags.ads1115_valid) {
-                ESP_LOGI(TAG_SYSTEM, "ADS1115: Voltage: %.2fV, Current: %.3fA",
+                SYSTEM_LOGI(TAG_SYSTEM, "ADS1115: Voltage: %.2fV, Current: %.3fA, Power: %.2fW",
                     g_data_sensor.ads1115.voltage,
-                    g_data_sensor.ads1115.current);
+                    g_data_sensor.ads1115.current,
+                    g_data_sensor.calc.power);
+            }
+            
+            if (g_data_sensor.flags.calc_valid) {
+                SYSTEM_LOGI(TAG_SYSTEM, "Calculated: Energy: %.2f kWh, Distance: %.2f m, AvgSpeed: %.2f km/h",
+                    g_data_sensor.calc.energy_kwh,
+                    g_data_sensor.calc.total_distance_m,
+                    g_data_sensor.calc.avg_speed_kmh);
+                SYSTEM_LOGI(TAG_SYSTEM, "Calc: Gear: %d, State: %d (0=idle,1=pull,2=glide), Pull: %.1fs, Glide: %.1fs",
+                    g_data_sensor.calc.current_gear,
+                    g_data_sensor.calc.drive_status,
+                    g_data_sensor.calc.pull_duration_s,
+                    g_data_sensor.calc.glide_duration_s);
             }
             
             if (g_data_sensor.flags.speed_valid) {
-                ESP_LOGI(TAG_SYSTEM, "Speed: %.2f km/h, Pulses: %ld",
+                SYSTEM_LOGI(TAG_SYSTEM, "Speed: %.2f km/h, Pulses: %ld",
                     g_data_sensor.speed.speed_kmh,
                     g_data_sensor.speed.pulse_count);
             }
             
             if (g_data_sensor.flags.gps_valid) {
-                ESP_LOGI(TAG_SYSTEM, "GPS: Lat: %.6f, Lon: %.6f, Sats: %d, Speed: %.1f km/h",
+                SYSTEM_LOGI(TAG_SYSTEM, "GPS: Lat: %.6f, Lon: %.6f, Sats: %d, Speed: %.1f km/h",
                     g_data_sensor.gps.latitude,
                     g_data_sensor.gps.longitude,
                     g_data_sensor.gps.satellites,
                     g_data_sensor.gps.speed_kmh);
             }
             
-            ESP_LOGI(TAG_SYSTEM, "WiFi: %s, CAN: %s",
+            if (g_data_sensor.flags.env_valid) {
+                SYSTEM_LOGI(TAG_SYSTEM, "Environment: Temp: %.2f°C, Humidity: %.2f%%",
+                    g_data_sensor.env.temperature,
+                    g_data_sensor.env.humidity);
+            }
+            
+            SYSTEM_LOGI(TAG_SYSTEM, "WiFi: %s, CAN: %s",
                 g_data_sensor.status.wifi_connected ? "Connected" : "Disconnected",
                 g_can_manager.isInitialized() ? "Active" : "Inactive");
             
@@ -336,15 +479,42 @@ void loop() {
         }
     }
 
-    //BLE notification wth 100ms interval
+    //BLE notification with 50ms interval (Full DataSensor_t struct)
     static uint32_t last_ble_time = 0;
+    static uint32_t ble_send_count = 0;
+    static bool size_info_logged = false;
+    
     if(millis() - last_ble_time >= 50)
     {
         last_ble_time = millis();
-        if (deviceConnected)
+        if (deviceConnected && g_data_sensor.flags.ble_init)
         {
-            pCharacteristic->setValue((uint8_t*)&g_data_sensor, sizeof(g_data_sensor));
+            // Send full DataSensor_t struct (MTU 512 supports this)
+            uint16_t payload_size = serializeToBluetoothPayload(&g_data_sensor);
+            
+            pCharacteristic->setValue((uint8_t*)&g_data_sensor, payload_size);
             pCharacteristic->notify();
+            ble_send_count++;
+            
+            // Log transmit config once on first send
+            if (!size_info_logged) {
+                BLE_LOGI(TAG_SYSTEM, "%s", getPayloadTransmitInfo());
+                size_info_logged = true;
+            }
+            
+            // Log active sensors every 20 sends (1 second)
+            if (ble_send_count % 20 == 0) {
+                BLE_LOGI(TAG_SYSTEM, "BLE TX: Message #%lu, Payload: %u bytes", ble_send_count, payload_size);
+                logActiveSensors(&g_data_sensor);
+                
+                // Log key sensor values for verification
+                BLE_LOGI(TAG_SYSTEM, "BLE Data Sample: V=%.2fV I=%.2fA Spd=%.1f km/h Pwr=%.1fW T=%.1f°C",
+                    g_data_sensor.ads1115.voltage,
+                    g_data_sensor.ads1115.current,
+                    g_data_sensor.speed.speed_kmh,
+                    g_data_sensor.calc.power,
+                    g_data_sensor.env.temperature);
+            }
         }
     
     }
@@ -359,5 +529,5 @@ void loop() {
         last_blink_time = millis();
     }
     
-    delay(100);
+    // delay(100);
 }

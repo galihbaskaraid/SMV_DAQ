@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"name": "SMV_DAQ",
+			"path": "."
+		},
+		{
+			"path": "../../../JM_01122025_(220us)"
+		}
+	],
+	"settings": {}
+}
