@@ -185,4 +185,26 @@
 #define HIDS_ADDRESS 0x44               // I2C address for WSEN_HIDS
 #define HIDS_TEMP_HUM_READ_INTERVAL_MS 1000  // Read interval
 
+// ============================================================================
+// BLE CONFIGURATION — Multi-characteristic architecture
+// ============================================================================
+// One service, 7 notify characteristics — each category has its own UUID so
+// the Android client can subscribe selectively and receive small payloads.
+#define BLE_DEVICE_NAME            "DAQ_SYSTEM"
+#define BLE_SERVICE_UUID           "12345678-1234-1234-1234-1234567890AB"
+
+// Characteristic UUIDs (one per data category)
+#define BLE_CHAR_POWER_UUID        "AAAA0001-1234-1234-1234-1234567890AB"  // Voltage, current, power, energy
+#define BLE_CHAR_SPEED_UUID        "AAAA0002-1234-1234-1234-1234567890AB"  // Speed, distance
+#define BLE_CHAR_IMU_UUID          "AAAA0003-1234-1234-1234-1234567890AB"  // Accel, gyro, temperature
+#define BLE_CHAR_GPS_UUID          "AAAA0004-1234-1234-1234-1234567890AB"  // Lat, lon, altitude, course
+#define BLE_CHAR_ENV_UUID          "AAAA0005-1234-1234-1234-1234567890AB"  // Ambient temp, humidity
+#define BLE_CHAR_CALC_UUID         "AAAA0006-1234-1234-1234-1234567890AB"  // Gear, drive state, durations
+#define BLE_CHAR_STATUS_UUID       "AAAA0007-1234-1234-1234-1234567890AB"  // Heap, uptime, sensor flags
+
+// Notification intervals
+#define BLE_FAST_INTERVAL_MS    100    // 20 Hz — Power, Speed, IMU
+#define BLE_MEDIUM_INTERVAL_MS  200   //  5 Hz — Calc / drive state
+#define BLE_SLOW_INTERVAL_MS    1000  //  1 Hz — GPS, Environment, Status
+
 #endif // CONSTANTS_H

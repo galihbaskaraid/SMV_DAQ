@@ -20,7 +20,7 @@
 #endif
 
 #ifndef DBG_COMPILE_UART
-#define DBG_COMPILE_UART 1
+#define DBG_COMPILE_UART 0
 #endif
 
 #ifndef DBG_COMPILE_CAN
@@ -44,7 +44,7 @@
 #endif
 
 #ifndef DBG_COMPILE_SENSOR
-#define DBG_COMPILE_SENSOR 1
+#define DBG_COMPILE_SENSOR 0
 #endif
 
 #ifndef DBG_COMPILE_CALC

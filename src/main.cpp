@@ -17,18 +17,28 @@
 #include "wifi_manager.h"
 #include "struct_offsets.h"
 
-//BLE
+// BLE — uses built-in ESP32 BLE library (bluedroid)
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-1234567890ab"
+// BLE UUIDs and notification intervals defined in constants.h
 
-BLEServer* pServer = nullptr;
-BLECharacteristic* pCharacteristic = nullptr;
+BLEServer*         pServer      = nullptr;
+BLECharacteristic* pChar_Power  = nullptr;  // 24 B @ 20 Hz — voltage, current, power, energy
+BLECharacteristic* pChar_Speed  = nullptr;  // 20 B @ 20 Hz — speed, distance
+BLECharacteristic* pChar_IMU    = nullptr;  // 32 B @ 20 Hz — accel, gyro
+BLECharacteristic* pChar_GPS    = nullptr;  // 30 B @  1 Hz — lat, lon, altitude
+BLECharacteristic* pChar_Env    = nullptr;  // 12 B @  1 Hz — ambient temp, humidity
+BLECharacteristic* pChar_Calc   = nullptr;  // 24 B @  5 Hz — gear, drive state
+BLECharacteristic* pChar_Status = nullptr;  // 10 B @  1 Hz — heap, uptime, flags
 bool deviceConnected = false;
+
+// MTU negotiation tracking — prevent race condition with BLE data transmission
+bool mtuConfigured = false;
+uint32_t deviceConnectTime = 0;
+const uint32_t MTU_WAIT_DELAY_MS = 1000;  // Wait 1 second after connect before sending data
 // ============================================================================
 // GLOBAL VARIABLES
 // ============================================================================
@@ -53,12 +63,15 @@ TaskHandle_t g_wifi_task_handle = nullptr;
 class ServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
-
-        BLE_LOGI(TAG_SYSTEM, "BLE Client connected");
+        mtuConfigured = false;  // Reset flag — MTU exchange hasn't happened yet
+        deviceConnectTime = millis();  // Record connection timestamp
+        BLE_LOGI(TAG_SYSTEM, "BLE Client connected — MTU exchange in progress...");
     }
 
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
+        mtuConfigured = false;  // Reset flag on disconnect
+        deviceConnectTime = 0;
         BLE_LOGI(TAG_SYSTEM, "BLE Client disconnected");
         pServer->startAdvertising();
     }
@@ -67,30 +80,46 @@ class ServerCallbacks : public BLEServerCallbacks {
 void initBLE()
 {
     BLE_LOGI(TAG_SYSTEM, "Initializing BLE...");
-    
-    BLEDevice::init("DAQ_SYSTEM");
+
+    BLEDevice::init(BLE_DEVICE_NAME);
     BLEDevice::setMTU(512);
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
 
-    BLEService* pService = pServer->createService(SERVICE_UUID);
+    // Allocate enough handles for 7 characteristics with descriptors (1 + 7×2 + 7×1 = 22 minimum)
+    BLEService* pService = pServer->createService(BLEUUID(BLE_SERVICE_UUID), 25);
 
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
-    );
+    // One notify characteristic per data category
+    pChar_Power  = pService->createCharacteristic(BLEUUID(BLE_CHAR_POWER_UUID),  BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_Speed  = pService->createCharacteristic(BLEUUID(BLE_CHAR_SPEED_UUID),  BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_IMU    = pService->createCharacteristic(BLEUUID(BLE_CHAR_IMU_UUID),    BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_GPS    = pService->createCharacteristic(BLEUUID(BLE_CHAR_GPS_UUID),    BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_Env    = pService->createCharacteristic(BLEUUID(BLE_CHAR_ENV_UUID),    BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_Calc   = pService->createCharacteristic(BLEUUID(BLE_CHAR_CALC_UUID),   BLECharacteristic::PROPERTY_NOTIFY);
+    pChar_Status = pService->createCharacteristic(BLEUUID(BLE_CHAR_STATUS_UUID), BLECharacteristic::PROPERTY_NOTIFY);
 
-    pCharacteristic->addDescriptor(new BLE2902());
+    pChar_Power ->addDescriptor(new BLE2902());
+    pChar_Speed ->addDescriptor(new BLE2902());
+    pChar_IMU   ->addDescriptor(new BLE2902());
+    pChar_GPS   ->addDescriptor(new BLE2902());
+    pChar_Env   ->addDescriptor(new BLE2902());
+    pChar_Calc  ->addDescriptor(new BLE2902());
+    pChar_Status->addDescriptor(new BLE2902());
 
     pService->start();
 
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
     pAdvertising->setScanResponse(false);
     pAdvertising->start();
-    
+
     g_data_sensor.flags.ble_init = true;
-    BLE_LOGI(TAG_SYSTEM, "✓ BLE initialized and advertising started");
+    BLE_LOGI(TAG_SYSTEM, "✓ BLE initialized: 7 characteristics on service %s", BLE_SERVICE_UUID);
+    BLE_LOGI(TAG_SYSTEM, "  Power=%dB Speed=%dB IMU=%dB GPS=%dB Env=%dB Calc=%dB Status=%dB",
+        (int)sizeof(BLE_PowerPayload_t),  (int)sizeof(BLE_SpeedPayload_t),
+        (int)sizeof(BLE_IMUPayload_t),    (int)sizeof(BLE_GPSPayload_t),
+        (int)sizeof(BLE_EnvPayload_t),    (int)sizeof(BLE_CalcPayload_t),
+        (int)sizeof(BLE_StatusPayload_t));
 }
 
 void sensorReadTask(void *pvParameters) {
@@ -366,7 +395,7 @@ void createTasks() {
 void setup() {
     // Initialize serial for logging
     Serial.begin(115200);
-    delay(500);
+    delay(100);
     
     SYSTEM_LOGI(TAG_SYSTEM, "\n\n===========================================");
     SYSTEM_LOGI(TAG_SYSTEM, "SMV Data Acquisition Board");
@@ -479,55 +508,91 @@ void loop() {
         }
     }
 
-    //BLE notification with 50ms interval (Full DataSensor_t struct)
-    static uint32_t last_ble_time = 0;
-    static uint32_t ble_send_count = 0;
-    static bool size_info_logged = false;
-    
-    if(millis() - last_ble_time >= 50)
-    {
-        last_ble_time = millis();
-        if (deviceConnected && g_data_sensor.flags.ble_init)
-        {
-            // Send full DataSensor_t struct (MTU 512 supports this)
-            uint16_t payload_size = serializeToBluetoothPayload(&g_data_sensor);
-            
-            pCharacteristic->setValue((uint8_t*)&g_data_sensor, payload_size);
-            pCharacteristic->notify();
-            ble_send_count++;
-            
-            // Log transmit config once on first send
-            if (!size_info_logged) {
-                BLE_LOGI(TAG_SYSTEM, "%s", getPayloadTransmitInfo());
-                size_info_logged = true;
+    // BLE notifications: separate update rates per data category
+    // NOTE: Only transmit data after MTU exchange is complete (delay-based approach)
+    static uint32_t ble_last_fast   = 0;  // 20 Hz — Power, Speed, IMU
+    static uint32_t ble_last_medium = 0;  //  5 Hz — Calc / drive state
+    static uint32_t ble_last_slow   = 0;  //  1 Hz — GPS, Environment, Status
+    static uint32_t ble_send_count  = 0;
+
+    // Check if MTU exchange has completed (wait MTU_WAIT_DELAY_MS ms after connection)
+    if (deviceConnected && !mtuConfigured && deviceConnectTime > 0) {
+        if (millis() - deviceConnectTime >= MTU_WAIT_DELAY_MS) {
+            mtuConfigured = true;
+            BLE_LOGI(TAG_SYSTEM, "✓ MTU exchange period elapsed — beginning BLE data transmission");
+        }
+    }
+
+    // Only send data if MTU is configured (race condition prevention)
+    if (deviceConnected && mtuConfigured && g_data_sensor.flags.ble_init) {
+        uint32_t now = millis();
+
+        // Fast characteristics @ 20 Hz — Power, Speed, IMU
+        if (now - ble_last_fast >= BLE_FAST_INTERVAL_MS) {
+            ble_last_fast = now;
+            BLE_PowerPayload_t pwr;
+            BLE_SpeedPayload_t spd;
+            BLE_IMUPayload_t   imu;
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+                serializePower(&g_data_sensor, &pwr);
+                serializeSpeed(&g_data_sensor, &spd);
+                serializeIMU  (&g_data_sensor, &imu);
+                xSemaphoreGive(g_data_sensor_mutex);
             }
-            
-            // Log active sensors every 20 sends (1 second)
-            if (ble_send_count % 20 == 0) {
-                BLE_LOGI(TAG_SYSTEM, "BLE TX: Message #%lu, Payload: %u bytes", ble_send_count, payload_size);
-                logActiveSensors(&g_data_sensor);
-                
-                // Log key sensor values for verification
-                BLE_LOGI(TAG_SYSTEM, "BLE Data Sample: V=%.2fV I=%.2fA Spd=%.1f km/h Pwr=%.1fW T=%.1f°C",
-                    g_data_sensor.ads1115.voltage,
-                    g_data_sensor.ads1115.current,
-                    g_data_sensor.speed.speed_kmh,
+            pChar_Power->setValue((uint8_t*)&pwr, sizeof(pwr));  pChar_Power->notify();
+            pChar_Speed->setValue((uint8_t*)&spd, sizeof(spd));  pChar_Speed->notify();
+            pChar_IMU  ->setValue((uint8_t*)&imu, sizeof(imu));  pChar_IMU->notify();
+            ble_send_count++;
+        }
+
+        // Medium characteristics @ 5 Hz — Calc / drive state
+        if (now - ble_last_medium >= BLE_MEDIUM_INTERVAL_MS) {
+            ble_last_medium = now;
+            BLE_CalcPayload_t calc;
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+                serializeCalc(&g_data_sensor, &calc);
+                xSemaphoreGive(g_data_sensor_mutex);
+            }
+            pChar_Calc->setValue((uint8_t*)&calc, sizeof(calc));  pChar_Calc->notify();
+        }
+
+        // Slow characteristics @ 1 Hz — GPS, Environment, Status
+        if (now - ble_last_slow >= BLE_SLOW_INTERVAL_MS) {
+            ble_last_slow = now;
+            BLE_GPSPayload_t    gps;
+            BLE_EnvPayload_t    env;
+            BLE_StatusPayload_t stat;
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+                serializeGPS   (&g_data_sensor, &gps);
+                serializeEnv   (&g_data_sensor, &env);
+                serializeStatus(&g_data_sensor, &stat);
+                xSemaphoreGive(g_data_sensor_mutex);
+            }
+            pChar_GPS   ->setValue((uint8_t*)&gps,  sizeof(gps));   pChar_GPS->notify();
+            pChar_Env   ->setValue((uint8_t*)&env,  sizeof(env));   pChar_Env->notify();
+            pChar_Status->setValue((uint8_t*)&stat, sizeof(stat));  pChar_Status->notify();
+
+            if (ble_send_count % 10 == 0) {
+                BLE_LOGI(TAG_SYSTEM, "BLE TX #%lu — fast×%lu | Pwr=%.1fW Spd=%.1fkm/h T=%.1f°C GPS:%d sats",
+                    ble_send_count, ble_send_count,
                     g_data_sensor.calc.power,
-                    g_data_sensor.env.temperature);
+                    g_data_sensor.speed.speed_kmh,
+                    g_data_sensor.env.temperature,
+                    g_data_sensor.gps.satellites);
+                logActiveSensors(&g_data_sensor);
             }
         }
-    
     }
     
-    // Blink LED to show system is running
+    // Blink LED to show system is running blinking pattern: 100ms on, 900ms off (10% duty cycle)
     static uint32_t last_blink_time = 0;
     static bool led_state = false;
-    
-    if (millis() - last_blink_time >= (led_state ? LED_ON_MS : LED_OFF_MS)) {
+    if (millis() - last_blink_time >= 1000) {
+        last_blink_time = millis();
         led_state = !led_state;
         digitalWrite(LED_PIN, led_state ? HIGH : LOW);
-        last_blink_time = millis();
     }
     
     // delay(100);
+    vTaskDelay(pdMS_TO_TICKS(5));  // Yield to other tasks
 }
