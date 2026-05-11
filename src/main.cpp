@@ -349,7 +349,7 @@ void createTasks() {
         nullptr,
         GPS_TASK_PRIORITY,
         &g_gps_task_handle,
-        APP_CPU_NUM
+        PRO_CPU_NUM               // Moved to PRO CPU (Core 0) to reduce APP CPU load
     );
     
     // CAN RX task (high priority, app CPU)
@@ -396,7 +396,7 @@ void setup() {
     // Initialize serial for logging
     Serial.begin(115200);
     delay(100);
-    
+    pinMode(LED_PIN, OUTPUT);
     SYSTEM_LOGI(TAG_SYSTEM, "\n\n===========================================");
     SYSTEM_LOGI(TAG_SYSTEM, "SMV Data Acquisition Board");
     SYSTEM_LOGI(TAG_SYSTEM, "Initializing...");
@@ -530,47 +530,59 @@ void loop() {
         // Fast characteristics @ 20 Hz — Power, Speed, IMU
         if (now - ble_last_fast >= BLE_FAST_INTERVAL_MS) {
             ble_last_fast = now;
-            BLE_PowerPayload_t pwr;
-            BLE_SpeedPayload_t spd;
-            BLE_IMUPayload_t   imu;
-            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+            BLE_PowerPayload_t pwr = {}; // Zero-initialize
+            BLE_SpeedPayload_t spd = {};
+            BLE_IMUPayload_t   imu = {};
+            
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(10))) {
                 serializePower(&g_data_sensor, &pwr);
                 serializeSpeed(&g_data_sensor, &spd);
                 serializeIMU  (&g_data_sensor, &imu);
                 xSemaphoreGive(g_data_sensor_mutex);
+                
+                // Only set value and notify if mutex was successfully acquired
+                pChar_Power->setValue((uint8_t*)&pwr, sizeof(pwr));  pChar_Power->notify();
+                pChar_Speed->setValue((uint8_t*)&spd, sizeof(spd));  pChar_Speed->notify();
+                pChar_IMU  ->setValue((uint8_t*)&imu, sizeof(imu));  pChar_IMU->notify();
+                ble_send_count++;
+            } else {
+                BLE_LOGW(TAG_SYSTEM, "BLE Fast: Mutex busy, skipping frame");
             }
-            pChar_Power->setValue((uint8_t*)&pwr, sizeof(pwr));  pChar_Power->notify();
-            pChar_Speed->setValue((uint8_t*)&spd, sizeof(spd));  pChar_Speed->notify();
-            pChar_IMU  ->setValue((uint8_t*)&imu, sizeof(imu));  pChar_IMU->notify();
-            ble_send_count++;
         }
 
         // Medium characteristics @ 5 Hz — Calc / drive state
         if (now - ble_last_medium >= BLE_MEDIUM_INTERVAL_MS) {
             ble_last_medium = now;
-            BLE_CalcPayload_t calc;
-            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+            BLE_CalcPayload_t calc = {}; // Zero-initialize
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(10))) {
                 serializeCalc(&g_data_sensor, &calc);
                 xSemaphoreGive(g_data_sensor_mutex);
+                
+                pChar_Calc->setValue((uint8_t*)&calc, sizeof(calc));  pChar_Calc->notify();
+            } else {
+                BLE_LOGW(TAG_SYSTEM, "BLE Medium: Mutex busy, skipping frame");
             }
-            pChar_Calc->setValue((uint8_t*)&calc, sizeof(calc));  pChar_Calc->notify();
         }
 
         // Slow characteristics @ 1 Hz — GPS, Environment, Status
         if (now - ble_last_slow >= BLE_SLOW_INTERVAL_MS) {
             ble_last_slow = now;
-            BLE_GPSPayload_t    gps;
-            BLE_EnvPayload_t    env;
-            BLE_StatusPayload_t stat;
-            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(5))) {
+            BLE_GPSPayload_t    gps  = {}; // Zero-initialize
+            BLE_EnvPayload_t    env  = {};
+            BLE_StatusPayload_t stat = {};
+            
+            if (xSemaphoreTake(g_data_sensor_mutex, pdMS_TO_TICKS(20))) {
                 serializeGPS   (&g_data_sensor, &gps);
                 serializeEnv   (&g_data_sensor, &env);
                 serializeStatus(&g_data_sensor, &stat);
                 xSemaphoreGive(g_data_sensor_mutex);
+                
+                pChar_GPS   ->setValue((uint8_t*)&gps,  sizeof(gps));   pChar_GPS->notify();
+                pChar_Env   ->setValue((uint8_t*)&env,  sizeof(env));   pChar_Env->notify();
+                pChar_Status->setValue((uint8_t*)&stat, sizeof(stat));  pChar_Status->notify();
+            } else {
+                BLE_LOGW(TAG_SYSTEM, "BLE Slow: Mutex busy, skipping frame");
             }
-            pChar_GPS   ->setValue((uint8_t*)&gps,  sizeof(gps));   pChar_GPS->notify();
-            pChar_Env   ->setValue((uint8_t*)&env,  sizeof(env));   pChar_Env->notify();
-            pChar_Status->setValue((uint8_t*)&stat, sizeof(stat));  pChar_Status->notify();
 
             if (ble_send_count % 10 == 0) {
                 BLE_LOGI(TAG_SYSTEM, "BLE TX #%lu — fast×%lu | Pwr=%.1fW Spd=%.1fkm/h T=%.1f°C GPS:%d sats",
@@ -594,5 +606,5 @@ void loop() {
     }
     
     // delay(100);
-    vTaskDelay(pdMS_TO_TICKS(5));  // Yield to other tasks
+    vTaskDelay(pdMS_TO_TICKS(1));  // Yield to other tasks
 }

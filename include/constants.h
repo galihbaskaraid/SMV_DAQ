@@ -203,7 +203,7 @@
 #define BLE_CHAR_STATUS_UUID       "AAAA0007-1234-1234-1234-1234567890AB"  // Heap, uptime, sensor flags
 
 // Notification intervals
-#define BLE_FAST_INTERVAL_MS    100    // 20 Hz — Power, Speed, IMU
+#define BLE_FAST_INTERVAL_MS    50    // 20 Hz — Power, Speed, IMU
 #define BLE_MEDIUM_INTERVAL_MS  200   //  5 Hz — Calc / drive state
 #define BLE_SLOW_INTERVAL_MS    1000  //  1 Hz — GPS, Environment, Status
 
